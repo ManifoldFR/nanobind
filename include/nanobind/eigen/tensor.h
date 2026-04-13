@@ -211,6 +211,66 @@ struct type_caster<
     }
 };
 
+template<typename Scalar, std::ptrdiff_t... Indices, int Options, typename IndexType>
+struct type_caster<
+        Eigen::TensorFixedSize<Scalar, Eigen::Sizes<Indices...>, Options, IndexType>,
+        enable_if_t<is_ndarray_scalar_v<Scalar>>> {
+    using PlainTensor = Eigen::TensorFixedSize<Scalar, Eigen::Sizes<Indices...>, Options, IndexType>;
+    static constexpr int NumIndices = PlainTensor::NumIndices;
+
+    using NDArray = ndarray<
+        Scalar,
+        numpy,
+        shape<size_t(Indices)...>,
+        std::conditional_t<
+            eigen_tensor_is_row_major_v<PlainTensor>,
+            c_contig,
+            f_contig>>;
+
+    using NDArrayCaster = make_caster<NDArray>;
+
+    NB_TYPE_CASTER(PlainTensor, NDArrayCaster::Name);
+
+
+    bool from_python(handle src, uint8_t flags, cleanup_list *cleanup) noexcept {
+        NDArrayCaster caster;
+        if (!caster.from_python(src, flags & ~(uint8_t)cast_flags::accepts_none, cleanup))
+            return false;
+
+        const NDArray &array = caster.value;
+        memcpy(value.data(), array.data(), array.size() * sizeof(Scalar));
+
+        return true;
+    }
+
+    template<typename T2>
+    static handle from_cpp(T2 &&v, rv_policy policy, cleanup_list *cleanup) noexcept {
+        policy = infer_policy<T2>(policy);
+        if constexpr (std::is_pointer_v<T2>)
+            return from_cpp_internal((const PlainTensor &) *v, policy, cleanup);
+        else
+            return from_cpp_internal((const PlainTensor &) v, policy, cleanup);
+    }
+
+    static handle from_cpp_internal(const PlainTensor &v, rv_policy policy, cleanup_list *cleanup) noexcept {
+        void *ptr = (void *)v.data();
+
+        object owner;
+        if (policy == rv_policy::move) {
+            PlainTensor *tmp = new PlainTensor((PlainTensor&&)v);
+            owner = capsule(tmp, [](void* p) noexcept {
+                delete (PlainTensor*) p;
+            });
+            ptr = tmp->data();
+            policy = rv_policy::reference;
+        } else if (policy == rv_policy::reference_internal && cleanup->self()) {
+            owner = borrow(cleanup->self());
+            policy = rv_policy::reference;
+        }
+        return NDArrayCaster::from_cpp(NDArray(ptr, {}, owner), policy, cleanup);
+    }
+};
+
 /** \brief Type caster for Tensor expressions. From-cpp conversion just converts the expression to a plain Tensor object.
  */
 template<typename T>
